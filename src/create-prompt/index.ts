@@ -18,25 +18,41 @@ import {
   isPullRequestReviewCommentEvent,
 } from "../github/context";
 import type { ParsedGitHubContext } from "../github/context";
-import type { CommonFields, PreparedContext, EventData } from "./types";
+import type {
+  CommonFields,
+  PreparedContext,
+  EventData,
+  ProviderAgnosticEvent,
+} from "./types";
+import { createGitLabEvent } from "./types";
 import { GITHUB_SERVER_URL } from "../github/api/config";
 export type { CommonFields, PreparedContext } from "./types";
 
-const BASE_ALLOWED_TOOLS = [
-  "Edit",
-  "Glob",
-  "Grep",
-  "LS",
-  "Read",
-  "Write",
-  "mcp__github_file_ops__commit_files",
-  "mcp__github_file_ops__delete_files",
-  "mcp__github_file_ops__update_claude_comment",
-];
+const BASE_ALLOWED_TOOLS = ["Edit", "Glob", "Grep", "LS", "Read", "Write"];
 const DISALLOWED_TOOLS = ["WebSearch", "WebFetch"];
 
-export function buildAllowedToolsString(customAllowedTools?: string[]): string {
+export function buildAllowedToolsString(
+  customAllowedTools?: string[],
+  provider?: string,
+): string {
   let baseTools = [...BASE_ALLOWED_TOOLS];
+
+  // Add provider-specific MCP tools
+  // Default to GitHub for backward compatibility when provider is not specified
+  if (provider === "gitlab") {
+    baseTools.push(
+      "mcp__gitlab_file_ops__commit_files",
+      "mcp__gitlab_file_ops__delete_files",
+      "mcp__gitlab_file_ops__update_claude_comment",
+    );
+  } else {
+    // Default to GitHub (including when provider is undefined)
+    baseTools.push(
+      "mcp__github_file_ops__commit_files",
+      "mcp__github_file_ops__delete_files",
+      "mcp__github_file_ops__update_claude_comment",
+    );
+  }
 
   let allAllowedTools = baseTools.join(",");
   if (customAllowedTools && customAllowedTools.length > 0) {
@@ -296,6 +312,127 @@ export function prepareContext(
   };
 }
 
+// Provider-agnostic context preparation
+export function prepareProviderContext(
+  provider: "github" | "gitlab",
+  eventInfo: {
+    entityType: "issue" | "merge_request" | "pull_request";
+    entityNumber: string;
+    eventTrigger?: string;
+    baseBranch: string;
+    claudeBranch?: string;
+    commentBody?: string;
+    commentId?: string;
+    assigneeTrigger?: string;
+  },
+  commonInfo: {
+    repository: string;
+    claudeCommentId: string;
+    triggerPhrase: string;
+    triggerUsername?: string;
+    customInstructions?: string;
+    allowedTools?: string;
+    disallowedTools?: string;
+    directPrompt?: string;
+  },
+): { commonFields: CommonFields; agnosticEvent: ProviderAgnosticEvent } {
+  // Create common fields
+  const commonFields: CommonFields = {
+    ...commonInfo,
+    provider,
+  };
+
+  // Create provider-agnostic event
+  let agnosticEvent: ProviderAgnosticEvent;
+
+  if (provider === "gitlab") {
+    agnosticEvent = createGitLabEvent(
+      eventInfo.entityType as "issue" | "merge_request",
+      eventInfo.entityNumber,
+      eventInfo.eventTrigger || "",
+      eventInfo.baseBranch,
+      eventInfo.claudeBranch,
+      eventInfo.commentBody,
+      eventInfo.commentId,
+      eventInfo.assigneeTrigger,
+    );
+  } else {
+    // For GitHub, we need to create the EventData first and then map it
+    // This is a temporary solution - ideally we'd refactor the GitHub context parsing
+    throw new Error("GitHub provider should use prepareContext for now");
+  }
+
+  return { commonFields, agnosticEvent };
+}
+
+// Provider-agnostic event type and context
+export function getProviderEventTypeAndContext(
+  event: ProviderAgnosticEvent,
+  triggerPhrase: string,
+): {
+  eventType: string;
+  triggerContext: string;
+} {
+  switch (event.eventName) {
+    case "merge_request_comment":
+      if (event.provider === "github") {
+        return {
+          eventType: "REVIEW_COMMENT",
+          triggerContext: `PR review comment with '${triggerPhrase}'`,
+        };
+      }
+      return {
+        eventType: "MERGE_REQUEST_COMMENT",
+        triggerContext: `Merge request comment with '${triggerPhrase}'`,
+      };
+
+    case "issue_comment":
+      return {
+        eventType: "GENERAL_COMMENT",
+        triggerContext: `issue comment with '${triggerPhrase}'`,
+      };
+
+    case "issue_opened":
+      return {
+        eventType: "ISSUE_CREATED",
+        triggerContext: `new issue with '${triggerPhrase}' in body`,
+      };
+
+    case "issue_assigned":
+      return {
+        eventType: "ISSUE_ASSIGNED",
+        triggerContext: `issue assigned to '${event.assigneeTrigger}'`,
+      };
+
+    case "merge_request_opened":
+      if (event.provider === "github") {
+        return {
+          eventType: "PULL_REQUEST",
+          triggerContext: `pull request opened`,
+        };
+      }
+      return {
+        eventType: "MERGE_REQUEST_OPENED",
+        triggerContext: `merge request opened`,
+      };
+
+    case "merge_request_updated":
+      if (event.provider === "github") {
+        return {
+          eventType: "PULL_REQUEST",
+          triggerContext: `pull request updated`,
+        };
+      }
+      return {
+        eventType: "MERGE_REQUEST_UPDATED",
+        triggerContext: `merge request updated`,
+      };
+
+    default:
+      throw new Error(`Unexpected event type: ${event.eventName}`);
+  }
+}
+
 export function getEventTypeAndContext(envVars: PreparedContext): {
   eventType: string;
   triggerContext: string;
@@ -349,6 +486,7 @@ export function getEventTypeAndContext(envVars: PreparedContext): {
 export function generatePrompt(
   context: PreparedContext,
   githubData: FetchDataResult,
+  provider?: string,
 ): string {
   const {
     contextData,
@@ -384,7 +522,7 @@ Images have been downloaded from GitHub comments and saved to disk. Their file p
     ? formatBody(contextData.body, imageUrlMap)
     : "No description provided";
 
-  let promptContent = `You are Claude, an AI assistant designed to help with GitHub issues and pull requests. Think carefully as you analyze the context and respond appropriately. Here's the context for your current task:
+  let promptContent = `You are Claude, an AI assistant designed to help with ${provider === "gitlab" ? "GitLab issues and merge requests" : "GitHub issues and pull requests"}. Think carefully as you analyze the context and respond appropriately. Here's the context for your current task:
 
 <formatted_context>
 ${formattedContext}
@@ -436,9 +574,9 @@ ${sanitizeContent(context.directPrompt)}
     : ""
 }
 ${`<comment_tool_info>
-IMPORTANT: You have been provided with the mcp__github_file_ops__update_claude_comment tool to update your comment. This tool automatically handles both issue and PR comments.
+IMPORTANT: You have been provided with the ${provider === "gitlab" ? "mcp__gitlab_file_ops__update_claude_comment" : "mcp__github_file_ops__update_claude_comment"} tool to update your comment. This tool automatically handles both issue and ${provider === "gitlab" ? "MR" : "PR"} comments.
 
-Tool usage example for mcp__github_file_ops__update_claude_comment:
+Tool usage example for ${provider === "gitlab" ? "mcp__gitlab_file_ops__update_claude_comment" : "mcp__github_file_ops__update_claude_comment"}:
 {
   "body": "Your comment text here"
 }
@@ -491,7 +629,7 @@ ${context.directPrompt ? `   - DIRECT INSTRUCTION: A direct instruction was prov
       - Formulate a concise, technical, and helpful response based on the context.
       - Reference specific code with inline formatting or code blocks.
       - Include relevant file paths and line numbers when applicable.
-      - ${eventData.isPR ? "IMPORTANT: Submit your review feedback by updating the Claude comment using mcp__github_file_ops__update_claude_comment. This will be displayed as your PR review." : "Remember that this feedback must be posted to the GitHub comment using mcp__github_file_ops__update_claude_comment."}
+      - ${eventData.isPR ? `IMPORTANT: Submit your review feedback by updating the Claude comment using ${provider === "gitlab" ? "mcp__gitlab_file_ops__update_claude_comment" : "mcp__github_file_ops__update_claude_comment"}. This will be displayed as your ${provider === "gitlab" ? "MR" : "PR"} review.` : `Remember that this feedback must be posted to the ${provider === "gitlab" ? "GitLab" : "GitHub"} comment using ${provider === "gitlab" ? "mcp__gitlab_file_ops__update_claude_comment" : "mcp__github_file_ops__update_claude_comment"}.`}
 
    B. For Straightforward Changes:
       - Use file system tools to make the change locally.
@@ -500,17 +638,26 @@ ${context.directPrompt ? `   - DIRECT INSTRUCTION: A direct instruction was prov
       ${
         eventData.isPR && !eventData.claudeBranch
           ? `
-      - Push directly using mcp__github_file_ops__commit_files to the existing branch (works for both new and existing files).
-      - Use mcp__github_file_ops__commit_files to commit files atomically in a single commit (supports single or multiple files).
-      - When pushing changes with this tool and TRIGGER_USERNAME is not "Unknown", include a "Co-authored-by: ${context.triggerUsername} <${context.triggerUsername}@users.noreply.github.com>" line in the commit message.`
+      - Push directly using ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"} to the existing branch (works for both new and existing files).
+      - Use ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"} to commit files atomically in a single commit (supports single or multiple files).
+      - When pushing changes with this tool and TRIGGER_USERNAME is not "Unknown", include a "Co-authored-by: ${context.triggerUsername} <${context.triggerUsername}@users.noreply.${provider === "gitlab" ? "gitlab" : "github"}.com>" line in the commit message.`
           : `
-      - You are already on the correct branch (${eventData.claudeBranch || "the PR branch"}). Do not create a new branch.
-      - Push changes directly to the current branch using mcp__github_file_ops__commit_files (works for both new and existing files)
-      - Use mcp__github_file_ops__commit_files to commit files atomically in a single commit (supports single or multiple files).
-      - When pushing changes and TRIGGER_USERNAME is not "Unknown", include a "Co-authored-by: ${context.triggerUsername} <${context.triggerUsername}@users.noreply.github.com>" line in the commit message.
+      - You are already on the correct branch (${eventData.claudeBranch || "the " + (provider === "gitlab" ? "MR" : "PR") + " branch"}). Do not create a new branch.
+      - Push changes directly to the current branch using ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"} (works for both new and existing files)
+      - Use ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"} to commit files atomically in a single commit (supports single or multiple files).
+      - When pushing changes and TRIGGER_USERNAME is not "Unknown", include a "Co-authored-by: ${context.triggerUsername} <${context.triggerUsername}@users.noreply.${provider === "gitlab" ? "gitlab" : "github"}.com>" line in the commit message.
       ${
         eventData.claudeBranch
-          ? `- Provide a URL to create a PR manually in this format:
+          ? provider === "gitlab"
+            ? `- Provide a URL to create a MR manually in this format:
+        [Create a MR](${process.env.CI_SERVER_URL || "https://gitlab.com"}/${context.repository}/-/merge_requests/new?merge_request[source_branch]=<branch-name>&merge_request[target_branch]=<target-branch>&merge_request[title]=<url-encoded-title>)
+        - IMPORTANT: Ensure all URL parameters are properly encoded - spaces should be encoded as %20, not left as spaces
+          Example: Instead of "fix: update welcome message", use "fix%3A%20update%20welcome%20message"
+        - The target-branch should be '${eventData.baseBranch}'.
+        - The branch-name is the current branch: ${eventData.claudeBranch}
+        - The title should include a clear description and reference to the original ${eventData.isPR ? "MR" : "issue"}
+        - Just include the markdown link with text "Create a MR" - do not add explanatory text before it`
+            : `- Provide a URL to create a PR manually in this format:
         [Create a PR](${GITHUB_SERVER_URL}/${context.repository}/compare/${eventData.baseBranch}...<branch-name>?quick_pull=1&title=<url-encoded-title>&body=<url-encoded-body>)
         - IMPORTANT: Use THREE dots (...) between branch names, not two (..)
           Example: ${GITHUB_SERVER_URL}/${context.repository}/compare/main...feature-branch (correct)
@@ -538,24 +685,24 @@ ${context.directPrompt ? `   - DIRECT INSTRUCTION: A direct instruction was prov
       - Or explain why it's too complex: mark todo as completed in checklist with explanation.
 
 5. Final Update:
-   - Always update the GitHub comment to reflect the current todo state.
+   - Always update the ${provider === "gitlab" ? "GitLab" : "GitHub"} comment to reflect the current todo state.
    - When all todos are completed, remove the spinner and add a brief summary of what was accomplished, and what was not done.
    - Note: If you see previous Claude comments with headers like "**Claude finished @user's task**" followed by "---", do not include this in your comment. The system adds this automatically.
-   - If you changed any files locally, you must update them in the remote branch via mcp__github_file_ops__commit_files before saying that you're done.
-   ${eventData.claudeBranch ? `- If you created anything in your branch, your comment must include the PR URL with prefilled title and body mentioned above.` : ""}
+   - If you changed any files locally, you must update them in the remote branch via ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"} before saying that you're done.
+   ${eventData.claudeBranch ? `- If you created anything in your branch, your comment must include the ${provider === "gitlab" ? "MR" : "PR"} URL with prefilled title and body mentioned above.` : ""}
 
 Important Notes:
-- All communication must happen through GitHub PR comments.
-- Never create new comments. Only update the existing comment using mcp__github_file_ops__update_claude_comment.
-- This includes ALL responses: code reviews, answers to questions, progress updates, and final results.${eventData.isPR ? "\n- PR CRITICAL: After reading files and forming your response, you MUST post it by calling mcp__github_file_ops__update_claude_comment. Do NOT just respond with a normal response, the user will not see it." : ""}
+- All communication must happen through ${provider === "gitlab" ? "GitLab MR/issue" : "GitHub PR"} comments.
+- Never create new comments. Only update the existing comment using ${provider === "gitlab" ? "mcp__gitlab_file_ops__update_claude_comment" : "mcp__github_file_ops__update_claude_comment"}.
+- This includes ALL responses: code reviews, answers to questions, progress updates, and final results.${eventData.isPR ? `\n- ${provider === "gitlab" ? "MR" : "PR"} CRITICAL: After reading files and forming your response, you MUST post it by calling ${provider === "gitlab" ? "mcp__gitlab_file_ops__update_claude_comment" : "mcp__github_file_ops__update_claude_comment"}. Do NOT just respond with a normal response, the user will not see it.` : ""}
 - You communicate exclusively by editing your single comment - not through any other means.
 - Use this spinner HTML when work is in progress: <img src="https://github.com/user-attachments/assets/5ac382c7-e004-429b-8e35-7feb3e8f9c6f" width="14px" height="14px" style="vertical-align: middle; margin-left: 4px;" />
-${eventData.isPR && !eventData.claudeBranch ? `- Always push to the existing branch when triggered on a PR.` : `- IMPORTANT: You are already on the correct branch (${eventData.claudeBranch || "the created branch"}). Never create new branches when triggered on issues or closed/merged PRs.`}
-- Use mcp__github_file_ops__commit_files for making commits (works for both new and existing files, single or multiple). Use mcp__github_file_ops__delete_files for deleting files (supports deleting single or multiple files atomically), or mcp__github__delete_file for deleting a single file. Edit files locally, and the tool will read the content from the same path on disk.
+${eventData.isPR && !eventData.claudeBranch ? `- Always push to the existing branch when triggered on a ${provider === "gitlab" ? "MR" : "PR"}.` : `- IMPORTANT: You are already on the correct branch (${eventData.claudeBranch || "the created branch"}). Never create new branches when triggered on issues or closed/merged ${provider === "gitlab" ? "MRs" : "PRs"}.`}
+- Use ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"} for making commits (works for both new and existing files, single or multiple). Use ${provider === "gitlab" ? "mcp__gitlab_file_ops__delete_files" : "mcp__github_file_ops__delete_files"} for deleting files (supports deleting single or multiple files atomically)${provider === "github" ? ", or mcp__github__delete_file for deleting a single file" : ""}. Edit files locally, and the tool will read the content from the same path on disk.
   Tool usage examples:
-  - mcp__github_file_ops__commit_files: {"files": ["path/to/file1.js", "path/to/file2.py"], "message": "feat: add new feature"}
-  - mcp__github_file_ops__delete_files: {"files": ["path/to/old.js"], "message": "chore: remove deprecated file"}
-- Display the todo list as a checklist in the GitHub comment and mark things off as you go.
+  - ${provider === "gitlab" ? "mcp__gitlab_file_ops__commit_files" : "mcp__github_file_ops__commit_files"}: {"files": ["path/to/file1.js", "path/to/file2.py"], "message": "feat: add new feature"}
+  - ${provider === "gitlab" ? "mcp__gitlab_file_ops__delete_files" : "mcp__github_file_ops__delete_files"}: {"files": ["path/to/old.js"], "message": "chore: remove deprecated file"}
+- Display the todo list as a checklist in the ${provider === "gitlab" ? "GitLab" : "GitHub"} comment and mark things off as you go.
 - REPOSITORY SETUP INSTRUCTIONS: The repository's CLAUDE.md file(s) contain critical repo-specific setup instructions, development guidelines, and preferences. Always read and follow these files, particularly the root CLAUDE.md, as they provide essential context for working with the codebase effectively.
 - Use h3 headers (###) for section titles in your comments, not h1 headers (#).
 - Your comment must always include the job run link (and branch link if there is one) at the bottom.
@@ -571,18 +718,18 @@ What You CAN Do:
 - Create pull requests for changes to human-authored code
 - Smart branch handling:
   - When triggered on an issue: Always create a new branch
-  - When triggered on an open PR: Always push directly to the existing PR branch
-  - When triggered on a closed PR: Create a new branch
+  - When triggered on an open ${provider === "gitlab" ? "MR" : "PR"}: Always push directly to the existing ${provider === "gitlab" ? "MR" : "PR"} branch
+  - When triggered on a closed ${provider === "gitlab" ? "MR" : "PR"}: Create a new branch
 
 What You CANNOT Do:
-- Submit formal GitHub PR reviews
-- Approve pull requests (for security reasons)
+- Submit formal ${provider === "gitlab" ? "GitLab MR" : "GitHub PR"} reviews
+- Approve ${provider === "gitlab" ? "merge requests" : "pull requests"} (for security reasons)
 - Post multiple comments (you only update your initial comment)
 - Execute commands outside the repository context
 - Run arbitrary Bash commands (unless explicitly allowed via allowed_tools configuration)
 - Perform branch operations (cannot merge branches, rebase, or perform other git operations beyond pushing commits)
-- Modify files in the .github/workflows directory (GitHub App permissions do not allow workflow modifications)
-- View CI/CD results or workflow run outputs (cannot access GitHub Actions logs or test results)
+- Modify files in the ${provider === "gitlab" ? ".gitlab-ci" : ".github/workflows"} directory (${provider === "gitlab" ? "GitLab" : "GitHub App"} permissions do not allow ${provider === "gitlab" ? "CI configuration" : "workflow"} modifications)
+- View CI/CD results or workflow run outputs (cannot access ${provider === "gitlab" ? "GitLab CI" : "GitHub Actions"} logs or test results)
 
 When users ask you to perform actions you cannot do, politely explain the limitation and, when applicable, direct them to the FAQ for more information and workarounds:
 "I'm unable to [specific action] due to [reason]. You can find more information and potential workarounds in the [FAQ](https://github.com/anthropics/claude-code-action/blob/main/FAQ.md)."
@@ -605,12 +752,136 @@ f. If you are unable to complete certain steps, such as running a linter or test
   return promptContent;
 }
 
+// Provider-agnostic prompt creation
+export async function createPromptV2(
+  claudeCommentId: number,
+  baseBranch: string | undefined,
+  claudeBranch: string | undefined,
+  githubData: FetchDataResult,
+  context: any, // Can be ParsedGitHubContext or GitLabContext
+  provider: "github" | "gitlab",
+) {
+  try {
+    let preparedContext: PreparedContext;
+
+    if (provider === "github") {
+      // Use existing GitHub logic
+      preparedContext = prepareContext(
+        context as ParsedGitHubContext,
+        claudeCommentId.toString(),
+        baseBranch,
+        claudeBranch,
+      );
+    } else {
+      // Create GitLab context
+      const gitlabContext = context as any; // GitLabContext
+      const repository = `${gitlabContext.projectPath}`;
+      const entityType = gitlabContext.mergeRequestIid
+        ? "merge_request"
+        : "issue";
+      const entityNumber =
+        gitlabContext.mergeRequestIid || gitlabContext.issueIid || "";
+
+      // Create common fields
+      const commonFields: CommonFields = {
+        repository,
+        claudeCommentId: claudeCommentId.toString(),
+        triggerPhrase: gitlabContext.inputs.triggerPhrase || "@claude",
+        customInstructions: gitlabContext.inputs.customInstructions,
+        allowedTools: gitlabContext.inputs.allowedTools,
+        disallowedTools: gitlabContext.inputs.disallowedTools,
+        directPrompt: gitlabContext.inputs.directPrompt,
+        provider,
+      };
+
+      // Create GitLab event
+      const agnosticEvent = createGitLabEvent(
+        entityType as "issue" | "merge_request",
+        entityNumber,
+        process.env.GITLAB_EVENT_TYPE || "",
+        baseBranch || gitlabContext.defaultBranch,
+        claudeBranch,
+        process.env.GITLAB_COMMENT_BODY,
+        process.env.GITLAB_COMMENT_ID,
+        gitlabContext.inputs.assigneeTrigger,
+      );
+
+      // Map to GitHub-like event for now (temporary compatibility)
+      const eventData: EventData = {
+        eventName: agnosticEvent.commentId ? "issue_comment" : "issues",
+        eventAction:
+          agnosticEvent.eventName === "issue_opened"
+            ? "opened"
+            : agnosticEvent.eventName === "issue_assigned"
+              ? "assigned"
+              : undefined,
+        isPR: agnosticEvent.isPR,
+        issueNumber: !agnosticEvent.isPR
+          ? agnosticEvent.entityNumber
+          : undefined,
+        prNumber: agnosticEvent.isPR ? agnosticEvent.entityNumber : undefined,
+        baseBranch: agnosticEvent.baseBranch,
+        claudeBranch: agnosticEvent.claudeBranch,
+        commentBody: agnosticEvent.commentBody || "",
+        commentId: agnosticEvent.commentId,
+        assigneeTrigger: agnosticEvent.assigneeTrigger,
+      } as any;
+
+      preparedContext = {
+        ...commonFields,
+        eventData,
+      };
+    }
+
+    // Use appropriate temp directory based on provider
+    const tempDir =
+      provider === "gitlab"
+        ? process.env.CI_PROJECT_DIR || process.cwd()
+        : process.env.RUNNER_TEMP || "/tmp";
+
+    await mkdir(`${tempDir}/claude-prompts`, {
+      recursive: true,
+    });
+
+    // Generate the prompt
+    const promptContent = generatePrompt(preparedContext, githubData, provider);
+
+    // Log the final prompt to console
+    console.log("===== FINAL PROMPT =====");
+    console.log(promptContent);
+    console.log("=======================");
+
+    // Write the prompt file
+    await writeFile(
+      `${tempDir}/claude-prompts/claude-prompt.txt`,
+      promptContent,
+    );
+
+    // Set allowed tools
+    const allAllowedTools = buildAllowedToolsString(
+      preparedContext.allowedTools?.split(","),
+      provider,
+    );
+    const allDisallowedTools = buildDisallowedToolsString(
+      preparedContext.disallowedTools?.split(","),
+      preparedContext.allowedTools?.split(","),
+    );
+
+    core.exportVariable("ALLOWED_TOOLS", allAllowedTools);
+    core.exportVariable("DISALLOWED_TOOLS", allDisallowedTools);
+  } catch (error) {
+    core.setFailed(`Create prompt failed with error: ${error}`);
+    process.exit(1);
+  }
+}
+
 export async function createPrompt(
   claudeCommentId: number,
   baseBranch: string | undefined,
   claudeBranch: string | undefined,
   githubData: FetchDataResult,
   context: ParsedGitHubContext,
+  provider?: string,
 ) {
   try {
     const preparedContext = prepareContext(
@@ -620,12 +891,18 @@ export async function createPrompt(
       claudeBranch,
     );
 
-    await mkdir(`${process.env.RUNNER_TEMP}/claude-prompts`, {
+    // Use appropriate temp directory based on provider
+    const tempDir =
+      provider === "gitlab"
+        ? process.env.CI_PROJECT_DIR || process.cwd()
+        : process.env.RUNNER_TEMP || "/tmp";
+
+    await mkdir(`${tempDir}/claude-prompts`, {
       recursive: true,
     });
 
     // Generate the prompt
-    const promptContent = generatePrompt(preparedContext, githubData);
+    const promptContent = generatePrompt(preparedContext, githubData, provider);
 
     // Log the final prompt to console
     console.log("===== FINAL PROMPT =====");
@@ -634,13 +911,14 @@ export async function createPrompt(
 
     // Write the prompt file
     await writeFile(
-      `${process.env.RUNNER_TEMP}/claude-prompts/claude-prompt.txt`,
+      `${tempDir}/claude-prompts/claude-prompt.txt`,
       promptContent,
     );
 
     // Set allowed tools
     const allAllowedTools = buildAllowedToolsString(
       context.inputs.allowedTools,
+      provider,
     );
     const allDisallowedTools = buildDisallowedToolsString(
       context.inputs.disallowedTools,

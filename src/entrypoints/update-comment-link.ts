@@ -1,142 +1,49 @@
 #!/usr/bin/env bun
 
-import { createOctokit } from "../github/api/client";
 import * as fs from "fs/promises";
-import {
-  updateCommentBody,
-  type CommentUpdateInput,
-} from "../github/operations/comment-logic";
-import {
-  parseGitHubContext,
-  isPullRequestReviewCommentEvent,
-} from "../github/context";
-import { GITHUB_SERVER_URL } from "../github/api/config";
-import { checkAndDeleteEmptyBranch } from "../github/operations/branch-cleanup";
-import { updateClaudeComment } from "../github/operations/comments/update-claude-comment";
+import { ProviderFactory } from "../providers/factory";
 
 async function run() {
   try {
+    // Environment variables
     const commentId = parseInt(process.env.CLAUDE_COMMENT_ID!);
-    const githubToken = process.env.GITHUB_TOKEN!;
     const claudeBranch = process.env.CLAUDE_BRANCH;
     const baseBranch = process.env.BASE_BRANCH || "main";
     const triggerUsername = process.env.TRIGGER_USERNAME;
 
-    const context = parseGitHubContext();
-    const { owner, repo } = context.repository;
-    const octokit = createOctokit(githubToken);
+    // Create provider and setup
+    const provider = ProviderFactory.create();
+    const providerType = ProviderFactory.getProviderContext().provider;
 
-    const serverUrl = GITHUB_SERVER_URL;
-    const jobUrl = `${serverUrl}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-
-    let comment;
-    let isPRReviewComment = false;
-
-    try {
-      // GitHub has separate ID namespaces for review comments and issue comments
-      // We need to use the correct API based on the event type
-      if (isPullRequestReviewCommentEvent(context)) {
-        // For PR review comments, use the pulls API
-        console.log(`Fetching PR review comment ${commentId}`);
-        const { data: prComment } = await octokit.rest.pulls.getReviewComment({
-          owner,
-          repo,
-          comment_id: commentId,
-        });
-        comment = prComment;
-        isPRReviewComment = true;
-        console.log("Successfully fetched as PR review comment");
-      }
-
-      // For all other event types, use the issues API
-      if (!comment) {
-        console.log(`Fetching issue comment ${commentId}`);
-        const { data: issueComment } = await octokit.rest.issues.getComment({
-          owner,
-          repo,
-          comment_id: commentId,
-        });
-        comment = issueComment;
-        isPRReviewComment = false;
-        console.log("Successfully fetched as issue comment");
-      }
-    } catch (finalError) {
-      // If all attempts fail, try to determine more information about the comment
-      console.error("Failed to fetch comment. Debug info:");
-      console.error(`Comment ID: ${commentId}`);
-      console.error(`Event name: ${context.eventName}`);
-      console.error(`Entity number: ${context.entityNumber}`);
-      console.error(`Repository: ${context.repository.full_name}`);
-
-      // Try to get the PR info to understand the comment structure
-      try {
-        const { data: pr } = await octokit.rest.pulls.get({
-          owner,
-          repo,
-          pull_number: context.entityNumber,
-        });
-        console.log(`PR state: ${pr.state}`);
-        console.log(`PR comments count: ${pr.comments}`);
-        console.log(`PR review comments count: ${pr.review_comments}`);
-      } catch {
-        console.error("Could not fetch PR info for debugging");
-      }
-
-      throw finalError;
+    // Get provider context
+    let context: any;
+    if (providerType === "github") {
+      const githubContext = (
+        await import("../github/context")
+      ).parseGitHubContext();
+      context = (
+        await import("../github/convert-context")
+      ).convertGitHubToProviderContext(githubContext);
+    } else {
+      const gitlabContext = (
+        await import("../gitlab/context")
+      ).parseGitLabContext();
+      context = (await import("../gitlab/context")).convertToProviderContext(
+        gitlabContext,
+      );
     }
 
-    const currentBody = comment.body ?? "";
-
-    // Check if we need to add branch link for new branches
-    const { shouldDeleteBranch, branchLink } = await checkAndDeleteEmptyBranch(
-      octokit,
-      owner,
-      repo,
-      claudeBranch,
-      baseBranch,
-    );
-
-    // Check if we need to add PR URL when we have a new branch
-    let prLink = "";
-    // If claudeBranch is set, it means we created a new branch (for issues or closed/merged PRs)
-    if (claudeBranch && !shouldDeleteBranch) {
-      // Check if comment already contains a PR URL
-      const serverUrlPattern = serverUrl.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const prUrlPattern = new RegExp(
-        `${serverUrlPattern}\\/.+\\/compare\\/${baseBranch.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\.\\.\\.`,
-      );
-      const containsPRUrl = currentBody.match(prUrlPattern);
-
-      if (!containsPRUrl) {
-        // Check if there are changes to the branch compared to the default branch
-        try {
-          const { data: comparison } =
-            await octokit.rest.repos.compareCommitsWithBasehead({
-              owner,
-              repo,
-              basehead: `${baseBranch}...${claudeBranch}`,
-            });
-
-          // If there are changes (commits or file changes), add the PR URL
-          if (
-            comparison.total_commits > 0 ||
-            (comparison.files && comparison.files.length > 0)
-          ) {
-            const entityType = context.isPR ? "PR" : "Issue";
-            const prTitle = encodeURIComponent(
-              `${entityType} #${context.entityNumber}: Changes from Claude`,
-            );
-            const prBody = encodeURIComponent(
-              `This PR addresses ${entityType.toLowerCase()} #${context.entityNumber}\n\nGenerated with [Claude Code](https://claude.ai/code)`,
-            );
-            const prUrl = `${serverUrl}/${owner}/${repo}/compare/${baseBranch}...${claudeBranch}?quick_pull=1&title=${prTitle}&body=${prBody}`;
-            prLink = `\n[Create a PR](${prUrl})`;
-          }
-        } catch (error) {
-          console.error("Error checking for changes in branch:", error);
-          // Don't fail the entire update if we can't check for changes
-        }
-      }
+    // Build job URL based on provider
+    let jobUrl: string;
+    if (providerType === "github") {
+      const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
+      const runId = process.env.GITHUB_RUN_ID;
+      jobUrl = `${serverUrl}/${context.repository.owner}/${context.repository.name}/actions/runs/${runId}`;
+    } else {
+      const serverUrl = process.env.CI_SERVER_URL || "https://gitlab.com";
+      const projectPath = process.env.CI_PROJECT_PATH;
+      const jobId = process.env.CI_JOB_ID;
+      jobUrl = `${serverUrl}/${projectPath}/-/jobs/${jobId}`;
     }
 
     // Check if action failed and read output file for execution details
@@ -190,40 +97,18 @@ async function run() {
       }
     }
 
-    // Prepare input for updateCommentBody function
-    const commentInput: CommentUpdateInput = {
-      currentBody,
+    // Update final comment using provider
+    await provider.updateFinalComment(context, commentId, {
+      jobUrl,
       actionFailed,
       executionDetails,
-      jobUrl,
-      branchLink,
-      prLink,
-      branchName: shouldDeleteBranch ? undefined : claudeBranch,
+      branchName: claudeBranch,
+      baseBranch,
       triggerUsername,
       errorDetails,
-    };
+    });
 
-    const updatedBody = updateCommentBody(commentInput);
-
-    try {
-      await updateClaudeComment(octokit.rest, {
-        owner,
-        repo,
-        commentId,
-        body: updatedBody,
-        isPullRequestReviewComment: isPRReviewComment,
-      });
-      console.log(
-        `✅ Updated ${isPRReviewComment ? "PR review" : "issue"} comment ${commentId} with job link`,
-      );
-    } catch (updateError) {
-      console.error(
-        `Failed to update ${isPRReviewComment ? "PR review" : "issue"} comment:`,
-        updateError,
-      );
-      throw updateError;
-    }
-
+    console.log(`✅ Updated comment ${commentId} with job link`);
     process.exit(0);
   } catch (error) {
     console.error("Error updating comment with job link:", error);

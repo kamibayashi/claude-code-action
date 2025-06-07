@@ -1,0 +1,91 @@
+# Example GitLab CI configuration for Claude Code Action
+
+variables:
+  CLAUDE_ACTION_IMAGE: "node:20"
+
+# Claude action job template
+.claude_action:
+  image: $CLAUDE_ACTION_IMAGE
+  script:
+    # Install Bun
+    - curl -fsSL https://bun.sh/install | bash
+    - export PATH="$HOME/.bun/bin:$PATH"
+
+    # Clone Claude Code Action
+    - git clone https://github.com/anthropics/claude-code-action.git /tmp/claude-action
+    - cd /tmp/claude-action
+    - bun install
+
+    # Run prepare step
+    - bun run src/entrypoints/prepare.ts
+
+    # Run Claude Code if triggered
+    - |
+      if [ -n "$CLAUDE_TRIGGERED" ]; then
+        # Install claude-code-base-action dependencies
+        npm install -g @anthropic/claude-code
+
+        # Run Claude Code
+        claude-code \
+          --prompt-file="$CI_PROJECT_DIR/claude-prompts/claude-prompt.txt" \
+          --allowed-tools="${ALLOWED_TOOLS}" \
+          --disallowed-tools="${DISALLOWED_TOOLS}" \
+          --timeout-minutes="${TIMEOUT_MINUTES:-30}" \
+          --model="${CLAUDE_MODEL}" \
+          --mcp-config="${MCP_CONFIG}"
+      fi
+
+    # Update comment with results
+    - |
+      export CLAUDE_COMMENT_ID="${CLAUDE_COMMENT_ID}"
+      export CLAUDE_BRANCH="${CLAUDE_BRANCH}"
+      export BASE_BRANCH="${BASE_BRANCH:-$CI_DEFAULT_BRANCH}"
+      export TRIGGER_USERNAME="${GITLAB_USER_LOGIN}"
+      export PREPARE_SUCCESS="${PREPARE_SUCCESS:-true}"
+      export PREPARE_ERROR="${PREPARE_ERROR}"
+      export CLAUDE_SUCCESS="${CLAUDE_SUCCESS:-true}"
+      export OUTPUT_FILE="${OUTPUT_FILE}"
+      bun run src/entrypoints/update-comment-link.ts
+
+  variables:
+    # Provider detection
+    GIT_PROVIDER: "gitlab"
+
+    # Claude configuration
+    TRIGGER_PHRASE: "@claude"
+    ALLOWED_TOOLS: ""
+    DISALLOWED_TOOLS: ""
+    CUSTOM_INSTRUCTIONS: ""
+
+    # Authentication
+    ANTHROPIC_API_KEY: "$ANTHROPIC_API_KEY" # Set in GitLab CI/CD variables
+    GITLAB_TOKEN: "$CI_JOB_TOKEN" # Use job token
+
+    # Model configuration
+    CLAUDE_MODEL: "${CLAUDE_MODEL:-claude-3-5-sonnet-latest}"
+
+# Trigger on merge request comments
+claude_on_mr_comment:
+  extends: .claude_action
+  only:
+    - merge_requests
+  when: manual
+  variables:
+    GITLAB_MERGE_REQUEST_IID: "$CI_MERGE_REQUEST_IID"
+
+# Trigger on issue comments
+claude_on_issue_comment:
+  extends: .claude_action
+  only:
+    - issues
+  when: manual
+  variables:
+    GITLAB_ISSUE_IID: "$CI_OPEN_MERGE_REQUESTS" # Needs to be parsed from webhook
+
+# Example of running Claude on a schedule
+claude_scheduled:
+  extends: .claude_action
+  only:
+    - schedules
+  variables:
+    DIRECT_PROMPT: "Review the latest changes and suggest improvements"
