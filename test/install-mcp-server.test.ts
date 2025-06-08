@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { prepareMcpConfig } from "../src/mcp/install-mcp-server";
+import { ProviderFactory } from "../src/providers/factory";
 import * as core from "@actions/core";
 
 describe("prepareMcpConfig", () => {
@@ -7,6 +8,7 @@ describe("prepareMcpConfig", () => {
   let consoleWarningSpy: any;
   let setFailedSpy: any;
   let processExitSpy: any;
+  let providerSpy: any;
 
   beforeEach(() => {
     consoleInfoSpy = spyOn(core, "info").mockImplementation(() => {});
@@ -15,6 +17,10 @@ describe("prepareMcpConfig", () => {
     processExitSpy = spyOn(process, "exit").mockImplementation(() => {
       throw new Error("Process exit");
     });
+    // Mock ProviderFactory to return GitHub as default
+    providerSpy = spyOn(ProviderFactory, "getProviderContext").mockReturnValue({
+      provider: "github",
+    });
   });
 
   afterEach(() => {
@@ -22,11 +28,12 @@ describe("prepareMcpConfig", () => {
     consoleWarningSpy.mockRestore();
     setFailedSpy.mockRestore();
     processExitSpy.mockRestore();
+    providerSpy.mockRestore();
   });
 
   test("should return base config when no additional config is provided and no allowed_tools", async () => {
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -49,7 +56,7 @@ describe("prepareMcpConfig", () => {
 
   test("should include github MCP server when mcp__github__ tools are allowed", async () => {
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -70,7 +77,7 @@ describe("prepareMcpConfig", () => {
 
   test("should not include github MCP server when only file_ops tools are allowed", async () => {
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -88,7 +95,7 @@ describe("prepareMcpConfig", () => {
 
   test("should include file_ops server even when no GitHub tools are allowed", async () => {
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -103,7 +110,7 @@ describe("prepareMcpConfig", () => {
 
   test("should return base config when additional config is empty string", async () => {
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -120,7 +127,7 @@ describe("prepareMcpConfig", () => {
 
   test("should return base config when additional config is whitespace only", async () => {
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -149,7 +156,7 @@ describe("prepareMcpConfig", () => {
     });
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -186,7 +193,7 @@ describe("prepareMcpConfig", () => {
     });
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -226,7 +233,7 @@ describe("prepareMcpConfig", () => {
     });
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -245,7 +252,7 @@ describe("prepareMcpConfig", () => {
     const invalidJson = "{ invalid json }";
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -265,7 +272,7 @@ describe("prepareMcpConfig", () => {
     const nonObjectJson = JSON.stringify("string value");
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -288,7 +295,7 @@ describe("prepareMcpConfig", () => {
     const nullJson = JSON.stringify(null);
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -311,7 +318,7 @@ describe("prepareMcpConfig", () => {
     const arrayJson = JSON.stringify([1, 2, 3]);
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -357,7 +364,7 @@ describe("prepareMcpConfig", () => {
     });
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -379,7 +386,7 @@ describe("prepareMcpConfig", () => {
     process.env.GITHUB_ACTION_PATH = "/test/action/path";
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",
@@ -399,7 +406,7 @@ describe("prepareMcpConfig", () => {
     delete process.env.GITHUB_WORKSPACE;
 
     const result = await prepareMcpConfig({
-      githubToken: "test-token",
+      token: "test-token",
       owner: "test-owner",
       repo: "test-repo",
       branch: "test-branch",

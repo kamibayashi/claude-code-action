@@ -1,0 +1,249 @@
+# GitLab CI configuration with automatic triggers for Claude Code
+# This example shows how to automatically run Claude when certain events occur
+
+variables:
+  # Default trigger phrase
+  DEFAULT_TRIGGER_PHRASE: "@claude"
+
+  # Allow customization via CI/CD variables
+  TRIGGER_PHRASE: ${CLAUDE_TRIGGER_PHRASE:-$DEFAULT_TRIGGER_PHRASE}
+
+# Reusable Claude Code job configuration
+.claude_code_template:
+  image: node:20
+
+  before_script:
+    # Install Bun
+    - curl -fsSL https://bun.sh/install | bash
+    - export PATH="$HOME/.bun/bin:$PATH"
+
+    # Clone and setup Claude Code Action
+    - git clone https://github.com/anthropics/claude-code-action.git /tmp/claude-code-action
+    - cd /tmp/claude-code-action
+    - bun install
+
+    # Make scripts executable
+    - chmod +x src/entrypoints/prepare.ts
+    - chmod +x src/entrypoints/update-comment-link.ts
+
+  script:
+    # Prepare step
+    - |
+      echo "Running Claude Code for context: ${CLAUDE_CONTEXT_TYPE}"
+      OUTPUT_FILE=/tmp/claude_output.json
+
+      bun run src/entrypoints/prepare.ts 2>&1 | tee prepare.log
+      PREPARE_EXIT_CODE=${PIPESTATUS[0]}
+
+      if [ $PREPARE_EXIT_CODE -ne 0 ]; then
+        echo "Prepare step failed"
+        export PREPARE_SUCCESS=false
+        export PREPARE_ERROR=$(tail -n 50 prepare.log)
+      else
+        export PREPARE_SUCCESS=true
+      fi
+
+    # Run Claude if prepare succeeded
+    - |
+      if [ "$PREPARE_SUCCESS" = "true" ] && [ -f prompt.txt ]; then
+        echo "Running Claude..."
+        npx claude-code-runner \
+          --prompt-file prompt.txt \
+          --output-file $OUTPUT_FILE \
+          --provider bedrock \
+          --mcp-config-file mcp_config.json
+        
+        if [ $? -eq 0 ]; then
+          export CLAUDE_SUCCESS=true
+        else
+          export CLAUDE_SUCCESS=false
+        fi
+      fi
+
+    # Update comment with results
+    - |
+      export OUTPUT_FILE=$OUTPUT_FILE
+      bun run src/entrypoints/update-comment-link.ts || true
+
+  artifacts:
+    when: always
+    paths:
+      - prompt.txt
+      - mcp_config.json
+      - prepare.log
+    expire_in: 1 week
+
+# Job triggered by merge request comments
+claude_on_mr_comment:
+  extends: .claude_code_template
+
+  rules:
+    # Only run on merge request notes (comments)
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_EVENT_TYPE == "note"'
+      # Check if comment contains trigger phrase
+      # Note: GitLab doesn't expose comment content directly, so we check in the job
+      when: always
+
+  variables:
+    CLAUDE_CONTEXT_TYPE: "merge_request_comment"
+    # GitLab automatically provides CI_MERGE_REQUEST_IID
+
+  before_script:
+    - !reference [.claude_code_template, before_script]
+    # Check if the comment contains the trigger phrase
+    - |
+      echo "Checking for trigger phrase in merge request comment..."
+      COMMENT_BODY=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes?sort=desc&per_page=1" \
+        | jq -r '.[0].body')
+
+      if ! echo "$COMMENT_BODY" | grep -qi "$TRIGGER_PHRASE"; then
+        echo "No trigger phrase found in comment. Skipping..."
+        exit 0
+      fi
+
+      echo "Trigger phrase found! Processing with Claude..."
+      export TRIGGER_USERNAME=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes?sort=desc&per_page=1" \
+        | jq -r '.[0].author.username')
+
+# Job triggered by issue comments
+claude_on_issue_comment:
+  extends: .claude_code_template
+
+  rules:
+    # Custom rule to detect issue comments
+    - if: '$CI_PIPELINE_SOURCE == "api" && $ISSUE_COMMENT_TRIGGER == "true"'
+      when: always
+
+  variables:
+    CLAUDE_CONTEXT_TYPE: "issue_comment"
+    GITLAB_ISSUE_IID: ${ISSUE_IID}
+
+  before_script:
+    - !reference [.claude_code_template, before_script]
+    # Validate issue comment trigger
+    - |
+      if [ -z "$GITLAB_ISSUE_IID" ]; then
+        echo "No issue IID provided. Skipping..."
+        exit 0
+      fi
+
+      echo "Processing issue #$GITLAB_ISSUE_IID with Claude..."
+
+# Job triggered when MR is created/updated with trigger phrase
+claude_on_mr_create:
+  extends: .claude_code_template
+
+  rules:
+    # Run on merge request creation or update
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && ($CI_MERGE_REQUEST_EVENT_TYPE == "open" || $CI_MERGE_REQUEST_EVENT_TYPE == "reopen" || $CI_MERGE_REQUEST_EVENT_TYPE == "update")'
+      when: always
+
+  variables:
+    CLAUDE_CONTEXT_TYPE: "merge_request"
+
+  before_script:
+    - !reference [.claude_code_template, before_script]
+    # Check if MR description contains trigger phrase
+    - |
+      echo "Checking for trigger phrase in merge request description..."
+      MR_DESCRIPTION=$(curl -s --header "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID" \
+        | jq -r '.description')
+
+      if ! echo "$MR_DESCRIPTION" | grep -qi "$TRIGGER_PHRASE"; then
+        echo "No trigger phrase found in MR description. Skipping..."
+        exit 0
+      fi
+
+      echo "Trigger phrase found! Processing with Claude..."
+      export TRIGGER_USERNAME=$GITLAB_USER_LOGIN
+
+# Job triggered when issue is created/updated with trigger phrase
+claude_on_issue_create:
+  extends: .claude_code_template
+
+  rules:
+    # This requires webhook or API trigger
+    - if: '$CI_PIPELINE_SOURCE == "api" && $ISSUE_TRIGGER == "true"'
+      when: always
+
+  variables:
+    CLAUDE_CONTEXT_TYPE: "issue"
+    GITLAB_ISSUE_IID: ${ISSUE_IID}
+
+  before_script:
+    - !reference [.claude_code_template, before_script]
+    # Validate issue trigger
+    - |
+      if [ -z "$GITLAB_ISSUE_IID" ]; then
+        echo "No issue IID provided. Skipping..."
+        exit 0
+      fi
+
+      echo "Processing issue #$GITLAB_ISSUE_IID with Claude..."
+
+# Manual trigger job (always available)
+claude_manual:
+  extends: .claude_code_template
+
+  rules:
+    - when: manual
+      allow_failure: true
+
+  variables:
+    CLAUDE_CONTEXT_TYPE: "manual"
+    # Can be set when triggering manually
+    MANUAL_MR_IID: ${CI_MERGE_REQUEST_IID}
+    MANUAL_ISSUE_IID: ${GITLAB_ISSUE_IID}
+
+  before_script:
+    - !reference [.claude_code_template, before_script]
+    - |
+      # Set context based on manual input
+      if [ -n "$MANUAL_MR_IID" ]; then
+        export CI_MERGE_REQUEST_IID=$MANUAL_MR_IID
+        echo "Manual trigger for MR #$CI_MERGE_REQUEST_IID"
+      elif [ -n "$MANUAL_ISSUE_IID" ]; then
+        export GITLAB_ISSUE_IID=$MANUAL_ISSUE_IID
+        echo "Manual trigger for Issue #$GITLAB_ISSUE_IID"
+      else
+        echo "Manual trigger without specific context"
+      fi
+
+# Helper job to set up issue comment triggers
+# This job needs to be triggered via API with issue information
+setup_issue_comment_trigger:
+  image: alpine:latest
+
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "webhook" && $WEBHOOK_EVENT == "note" && $NOTEABLE_TYPE == "Issue"'
+      when: always
+
+  script:
+    - apk add --no-cache curl jq
+    # Trigger the actual Claude job with issue context
+    - |
+      curl -X POST \
+        -F token=$CI_JOB_TOKEN \
+        -F ref=$CI_COMMIT_REF_NAME \
+        -F "variables[ISSUE_COMMENT_TRIGGER]=true" \
+        -F "variables[ISSUE_IID]=$ISSUE_IID" \
+        -F "variables[TRIGGER_USERNAME]=$NOTE_AUTHOR_USERNAME" \
+        "$CI_API_V4_URL/projects/$CI_PROJECT_ID/trigger/pipeline"
+
+# Example of a combined workflow
+claude_code_workflow:
+  stage: deploy
+  rules:
+    # Only run if one of the Claude jobs succeeded
+    - if: '$CLAUDE_JOB_RESULT == "success"'
+      when: on_success
+
+  script:
+    - echo "Claude Code completed successfully!"
+    - echo "You can add additional steps here, like:"
+    - echo "- Auto-merge if all tests pass"
+    - echo "- Deploy to staging"
+    - echo "- Send notifications"

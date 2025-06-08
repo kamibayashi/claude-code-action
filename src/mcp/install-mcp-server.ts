@@ -1,69 +1,96 @@
 import * as core from "@actions/core";
+import { ProviderFactory } from "../providers/factory";
 
 type PrepareConfigParams = {
-  githubToken: string;
-  owner: string;
-  repo: string;
+  token: string;
   branch: string;
   additionalMcpConfig?: string;
   claudeCommentId?: string;
   allowedTools: string[];
+  // GitHub specific
+  owner?: string;
+  repo?: string;
+  // GitLab specific
+  projectPath?: string;
 };
 
 export async function prepareMcpConfig(
   params: PrepareConfigParams,
 ): Promise<string> {
   const {
-    githubToken,
-    owner,
-    repo,
+    token,
     branch,
     additionalMcpConfig,
     claudeCommentId,
     allowedTools,
+    owner,
+    repo,
+    projectPath,
   } = params;
   try {
     const allowedToolsList = allowedTools || [];
+    const providerType = ProviderFactory.getProviderContext().provider;
 
-    const hasGitHubMcpTools = allowedToolsList.some((tool) =>
-      tool.startsWith("mcp__github__"),
-    );
-
-    const baseMcpConfig: { mcpServers: Record<string, unknown> } = {
-      mcpServers: {
-        github_file_ops: {
-          command: "bun",
-          args: [
-            "run",
-            `${process.env.GITHUB_ACTION_PATH}/src/mcp/github-file-ops-server.ts`,
-          ],
-          env: {
-            GITHUB_TOKEN: githubToken,
-            REPO_OWNER: owner,
-            REPO_NAME: repo,
-            BRANCH_NAME: branch,
-            REPO_DIR: process.env.GITHUB_WORKSPACE || process.cwd(),
-            ...(claudeCommentId && { CLAUDE_COMMENT_ID: claudeCommentId }),
-            GITHUB_EVENT_NAME: process.env.GITHUB_EVENT_NAME || "",
-            IS_PR: process.env.IS_PR || "false",
-          },
-        },
-      },
+    let baseMcpConfig: { mcpServers: Record<string, unknown> } = {
+      mcpServers: {},
     };
 
-    if (hasGitHubMcpTools) {
-      baseMcpConfig.mcpServers.github = {
-        command: "docker",
+    if (providerType === "github") {
+      const hasGitHubMcpTools = allowedToolsList.some((tool) =>
+        tool.startsWith("mcp__github__"),
+      );
+
+      baseMcpConfig.mcpServers.github_file_ops = {
+        command: "bun",
         args: [
           "run",
-          "-i",
-          "--rm",
-          "-e",
-          "GITHUB_PERSONAL_ACCESS_TOKEN",
-          "ghcr.io/github/github-mcp-server:sha-e9f748f", // https://github.com/github/github-mcp-server/releases/tag/v0.4.0
+          `${process.env.GITHUB_ACTION_PATH}/src/mcp/github-file-ops-server.ts`,
         ],
         env: {
-          GITHUB_PERSONAL_ACCESS_TOKEN: githubToken,
+          GITHUB_TOKEN: token,
+          REPO_OWNER: owner,
+          REPO_NAME: repo,
+          BRANCH_NAME: branch,
+          REPO_DIR: process.env.GITHUB_WORKSPACE || process.cwd(),
+          ...(claudeCommentId && { CLAUDE_COMMENT_ID: claudeCommentId }),
+          GITHUB_EVENT_NAME: process.env.GITHUB_EVENT_NAME || "",
+          IS_PR: process.env.IS_PR || "false",
+        },
+      };
+
+      if (hasGitHubMcpTools) {
+        baseMcpConfig.mcpServers.github = {
+          command: "docker",
+          args: [
+            "run",
+            "-i",
+            "--rm",
+            "-e",
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "ghcr.io/github/github-mcp-server:sha-e9f748f", // https://github.com/github/github-mcp-server/releases/tag/v0.4.0
+          ],
+          env: {
+            GITHUB_PERSONAL_ACCESS_TOKEN: token,
+          },
+        };
+      }
+    } else if (providerType === "gitlab") {
+      baseMcpConfig.mcpServers.gitlab_file_ops = {
+        command: "bun",
+        args: [
+          "run",
+          `${process.env.CI_PROJECT_DIR}/src/mcp/gitlab-file-ops-server.ts`,
+        ],
+        env: {
+          GITLAB_TOKEN: token,
+          PROJECT_PATH: projectPath,
+          BRANCH_NAME: branch,
+          REPO_DIR: process.env.CI_PROJECT_DIR || process.cwd(),
+          GITLAB_SERVER_URL: process.env.CI_SERVER_URL || "https://gitlab.com",
+          ...(claudeCommentId && { CLAUDE_COMMENT_ID: claudeCommentId }),
+          GITLAB_EVENT_TYPE: process.env.CI_PIPELINE_SOURCE || "",
+          CI_MERGE_REQUEST_IID: process.env.CI_MERGE_REQUEST_IID || "",
+          GITLAB_ISSUE_IID: process.env.GITLAB_ISSUE_IID || "",
         },
       };
     }
