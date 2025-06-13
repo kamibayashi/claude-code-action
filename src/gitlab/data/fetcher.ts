@@ -1,5 +1,5 @@
 /**
- * Fetch data from GitLab API
+ * Fetch data from GitLab API with parallel processing for improved performance
  */
 
 import type { GitLabClient } from "../api/client";
@@ -26,7 +26,7 @@ export async function fetchGitLabData({
   entityNumber,
   isMR,
 }: FetchGitLabDataOptions): Promise<ProviderData> {
-  // Fetch project details
+  // Fetch project details first as it's needed for repository info
   const project = await client.get<GitLabProject>(
     `/projects/${encodeURIComponent(projectPath)}`,
   );
@@ -38,7 +38,7 @@ export async function fetchGitLabData({
   };
 
   if (isMR) {
-    // Fetch merge request data
+    // Fetch merge request data with parallel processing
     const mr = await fetchMergeRequestData(client, projectPath, entityNumber);
     return {
       mergeRequest: mr,
@@ -59,49 +59,55 @@ async function fetchMergeRequestData(
   projectPath: string,
   mrIid: string,
 ): Promise<ProviderData["mergeRequest"]> {
-  // Fetch MR details
-  const mr = await client.get<GitLabMergeRequest>(
-    `/projects/${encodeURIComponent(projectPath)}/merge_requests/${mrIid}`,
-  );
+  const encodedProjectPath = encodeURIComponent(projectPath);
+  
+  // Execute all API calls in parallel for better performance
+  const [mr, notesResponse, commitsResponse, diffsResponse] = await Promise.allSettled([
+    client.get<GitLabMergeRequest>(
+      `/projects/${encodedProjectPath}/merge_requests/${mrIid}`,
+    ),
+    client.get<GitLabNote[]>(
+      `/projects/${encodedProjectPath}/merge_requests/${mrIid}/notes?sort=asc`,
+    ),
+    client.get<GitLabCommit[]>(
+      `/projects/${encodedProjectPath}/merge_requests/${mrIid}/commits`,
+    ),
+    client.get<GitLabDiff[]>(
+      `/projects/${encodedProjectPath}/merge_requests/${mrIid}/diffs`,
+    ),
+  ]);
 
-  // Fetch MR notes (comments)
-  const notesResponse = await client.get<GitLabNote[]>(
-    `/projects/${encodeURIComponent(projectPath)}/merge_requests/${mrIid}/notes?sort=asc`,
-  );
-  const notes = Array.isArray(notesResponse) ? notesResponse : [];
+  // Handle MR data (required)
+  if (mr.status === 'rejected') {
+    throw new Error(`Failed to fetch merge request: ${mr.reason}`);
+  }
+  const mrData = mr.value;
 
-  // Fetch MR commits
-  const commitsResponse = await client.get<GitLabCommit[]>(
-    `/projects/${encodeURIComponent(projectPath)}/merge_requests/${mrIid}/commits`,
-  );
-  const commits = Array.isArray(commitsResponse) ? commitsResponse : [];
-
-  // Fetch MR changes (diffs)
-  const diffsResponse = await client.get<GitLabDiff[]>(
-    `/projects/${encodeURIComponent(projectPath)}/merge_requests/${mrIid}/diffs`,
-  );
-  const diffs = Array.isArray(diffsResponse) ? diffsResponse : [];
+  // Handle optional data with fallbacks
+  const notes = handleOptionalData(notesResponse, 'notes', []);
+  const commits = handleOptionalData(commitsResponse, 'commits', []);
+  const diffs = handleOptionalData(diffsResponse, 'diffs', []);
 
   // Convert to provider format
   const result = {
-    title: mr.title,
-    description: mr.description || "",
-    author: mr.author
+    title: mrData.title,
+    description: mrData.description || "",
+    author: mrData.author
       ? {
-          username: mr.author.username,
-          displayName: mr.author.name,
+          username: mrData.author.username,
+          displayName: mrData.author.name,
         }
       : {
           username: "unknown",
           displayName: "Unknown",
         },
-    sourceBranch: mr.source_branch,
-    targetBranch: mr.target_branch,
-    headSha: mr.sha,
-    createdAt: mr.created_at,
+    sourceBranch: mrData.source_branch,
+    targetBranch: mrData.target_branch,
+    headSha: mrData.sha,
+    createdAt: mrData.created_at,
     additions: 0, // Will be calculated from diffs
     deletions: 0, // Will be calculated from diffs
-    state: mapMRState(mr.state),
+    state: mapMRState(mrData.state),
     commits: commits.map((commit) => ({
       sha: commit.id,
       message: commit.message,
@@ -110,7 +116,7 @@ async function fetchMergeRequestData(
         email: commit.author_email,
       },
     })),
-    files: (diffs || []).map((change) => ({
+    files: diffs.map((change) => ({
       path: change.new_path,
       additions: countAdditions(change.diff),
       deletions: countDeletions(change.diff),
@@ -155,32 +161,42 @@ async function fetchIssueData(
   projectPath: string,
   issueIid: string,
 ): Promise<ProviderData["issue"]> {
-  // Fetch issue details
-  const issue = await client.get<GitLabIssue>(
-    `/projects/${encodeURIComponent(projectPath)}/issues/${issueIid}`,
-  );
+  const encodedProjectPath = encodeURIComponent(projectPath);
+  
+  // Execute API calls in parallel
+  const [issue, notesResponse] = await Promise.allSettled([
+    client.get<GitLabIssue>(
+      `/projects/${encodedProjectPath}/issues/${issueIid}`,
+    ),
+    client.get<GitLabNote[]>(
+      `/projects/${encodedProjectPath}/issues/${issueIid}/notes?sort=asc`,
+    ),
+  ]);
 
-  // Fetch issue notes (comments)
-  const notesResponse = await client.get<GitLabNote[]>(
-    `/projects/${encodeURIComponent(projectPath)}/issues/${issueIid}/notes?sort=asc`,
-  );
-  const notes = Array.isArray(notesResponse) ? notesResponse : [];
+  // Handle issue data (required)
+  if (issue.status === 'rejected') {
+    throw new Error(`Failed to fetch issue: ${issue.reason}`);
+  }
+  const issueData = issue.value;
+
+  // Handle optional data with fallbacks
+  const notes = handleOptionalData(notesResponse, 'notes', []);
 
   // Convert to provider format
   return {
-    title: issue.title,
-    description: issue.description || "",
-    author: issue.author
+    title: issueData.title,
+    description: issueData.description || "",
+    author: issueData.author
       ? {
-          username: issue.author.username,
-          displayName: issue.author.name,
+          username: issueData.author.username,
+          displayName: issueData.author.name,
         }
       : {
           username: "unknown",
           displayName: "Unknown",
         },
-    createdAt: issue.created_at,
-    state: issue.state === "opened" ? "open" : "closed",
+    createdAt: issueData.created_at,
+    state: issueData.state === "opened" ? "open" : "closed",
     comments: notes
       .filter((note) => !note.system) // Exclude system notes
       .map((note) => ({
@@ -198,6 +214,20 @@ async function fetchIssueData(
         createdAt: note.created_at,
       })),
   };
+}
+
+function handleOptionalData<T>(
+  settledResult: PromiseSettledResult<T[]>,
+  dataType: string,
+  fallback: T[]
+): T[] {
+  if (settledResult.status === 'fulfilled') {
+    const data = settledResult.value;
+    return Array.isArray(data) ? data : fallback;
+  } else {
+    // Silently return fallback data if fetch fails for optional data
+    return fallback;
+  }
 }
 
 function mapMRState(gitlabState: string): string {
@@ -223,11 +253,11 @@ function mapChangeType(change: GitLabDiff): string {
 function countAdditions(diff: string): number {
   if (!diff) return 0;
   const lines = diff.split("\n");
-  return lines.filter((line) => line.startsWith("+")).length;
+  return lines.filter((line) => line.startsWith("+") && !line.startsWith("+++")).length;
 }
 
 function countDeletions(diff: string): number {
   if (!diff) return 0;
   const lines = diff.split("\n");
-  return lines.filter((line) => line.startsWith("-")).length;
+  return lines.filter((line) => line.startsWith("-") && !line.startsWith("---")).length;
 }
